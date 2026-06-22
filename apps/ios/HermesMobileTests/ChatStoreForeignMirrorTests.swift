@@ -93,7 +93,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "MIRRORTEST reply", "status": "completed"]))
 
+        // Deterministic drain: await the Task { await backfill() } that
+        // handleForeignFrame spawns on message.complete — no wall-clock settle().
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
 
         XCTAssertTrue(fetched, "foreign message.complete must run backfill, not no-op while streaming")
         XCTAssertFalse(chat.isStreaming, "streaming must clear after the mirrored turn reconciles")
@@ -128,7 +134,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.start", runtime: foreignRuntime, stored: storedId,
             payload: ["role": "assistant"]))
-        await settle()  // let the detached mergeForeignUserRows fetch + apply run
+        // Deterministic drain: await the detached mergeForeignUserRows fetch Task
+        // that message.start spawns — no wall-clock dependency.
+        #if DEBUG
+        await chat.waitForPendingForeignUserRowMergeForTesting()
+        #else
+        await settle()
+        #endif
 
         XCTAssertTrue(
             chat.messages.contains { $0.role == .user && $0.text.contains("hello from desktop") },
@@ -143,7 +155,12 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "MIRRORTEST reply", "status": "completed"]))
+        // Deterministic drain: await the foreign-complete backfill Task.
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
 
         XCTAssertEqual(
             chat.messages.filter { $0.role == .user && $0.text.contains("hello from desktop") }.count, 1,
@@ -172,7 +189,12 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.start", runtime: foreignRuntime, stored: storedId,
             payload: ["role": "assistant"]))
+        // Deterministic drain: await the detached mergeForeignUserRows Task.
+        #if DEBUG
+        await chat.waitForPendingForeignUserRowMergeForTesting()
+        #else
         await settle()
+        #endif
         let userRowsAtStart = chat.messages.filter { $0.role == .user && $0.text.contains("hello from desktop") }
         XCTAssertEqual(userRowsAtStart.count, 1, "user row surfaces once at start time")
         let idAtStart = userRowsAtStart.first?.id
@@ -180,7 +202,12 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "MIRRORTEST reply", "status": "completed"]))
+        // Deterministic drain: await the foreign-complete backfill Task.
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
         let userRowsAfter = chat.messages.filter { $0.role == .user && $0.text.contains("hello from desktop") }
         XCTAssertEqual(userRowsAfter.count, 1,
             "a growing complete-time transcript reconciles the start-time user row in place — exactly one bubble")
@@ -204,7 +231,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
             type: "message.delta", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "TEST"]))
 
-        await settle()  // let the 40ms flush apply the buffered deltas
+        // Deterministic drain: cancel the 40ms coalescing Task and call
+        // flushBuffers() directly — no wall-clock dependency (CI-safe).
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
+        await settle()
+        #endif
 
         XCTAssertTrue(
             chat.messages.contains { $0.role == .assistant && $0.text.contains("MIRRORTEST") },
@@ -237,7 +270,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
             "payload": ["text": .string("local answer")],
         ]))!
         chat.handle(event: localDelta)
+        // Deterministic drain: flush the 40ms coalescing buffer so the local
+        // delta's text lands before we sample the state.
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertTrue(chat.isStreaming)
         let localCountBefore = chat.messages.count
 
@@ -253,7 +292,8 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "FOREIGN reply", "status": "completed"]))
-        await settle()
+        // All foreign frames are dropped synchronously (local turn owns the stream).
+        await Task.yield()
 
         XCTAssertTrue(chat.isStreaming, "the local turn must still be streaming")
         XCTAssertFalse(backfillCalled, "a foreign turn must not backfill over a live local turn")
@@ -269,7 +309,9 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
             "payload": ["text": .string("local answer final"), "status": .string("completed")],
         ]))!
         chat.handle(event: localComplete)
-        await settle()
+        // handleMessageComplete is synchronous; a single yield lets any MainActor
+        // mutations propagate before asserting.
+        await Task.yield()
         XCTAssertFalse(chat.isStreaming)
         XCTAssertTrue(chat.messages.contains { $0.role == .assistant && $0.text.contains("local answer") },
                       "the local reply must be intact after foreign interference")
@@ -296,7 +338,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "x", "status": "completed"]))
+        // Deterministic drain: await the foreign-complete backfill Task (which
+        // throws and surfaces the error on lastBackfillError).
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
 
         XCTAssertEqual(chat.lastBackfillError, "simulated REST 503",
                        "a backfill REST error must surface on lastBackfillError")
@@ -330,7 +378,8 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.start", runtime: foreignRuntime, stored: "some-other-stored",
             payload: ["role": "assistant"]))
-        await settle()
+        // The mismatched gate is synchronous — no async work runs.
+        await Task.yield()
         XCTAssertFalse(chat.isStreaming)
         XCTAssertTrue(chat.messages.isEmpty)
         #if DEBUG
@@ -346,7 +395,9 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.start", runtime: foreignRuntime, stored: storedId,
             payload: ["role": "assistant"]))
-        await settle()
+        // Adoption (beginStreamingMessage) is synchronous; mergeForeignUserRows
+        // fires a Task but we are only asserting isStreaming here.
+        await Task.yield()
         XCTAssertTrue(chat.isStreaming, "a trimmed-equal stored id must still correlate")
         #if DEBUG
         XCTAssertEqual(chat.foreignMirrorTelemetry.foreignAdopted, 1)
@@ -408,7 +459,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.delta", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "TEST"]))
+        // Deterministic drain: cancel the 40ms coalescing Task and call
+        // flushBuffers() directly — no wall-clock dependency (CI-safe).
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertTrue(
             chat.messages.contains { $0.role == .assistant && $0.text.contains("MIRRORTEST") },
             "adopted foreign deltas must render even though they arrived while runtime was nil")
@@ -421,7 +478,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "MIRRORTEST reply", "status": "completed"]))
+        // Deterministic backfill drain: await the Task { await backfill() } that
+        // handleForeignFrame spawns on message.complete — no wall-clock settle().
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertTrue(fetched, "foreign complete must reconcile via backfill")
         XCTAssertFalse(chat.isStreaming, "streaming must clear after the mirrored turn reconciles")
         XCTAssertTrue(
@@ -461,7 +524,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.delta", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "MIRRORTEST"]))
+        // Deterministic drain: cancel the 40ms coalescing Task and flush directly
+        // so the delta's text lands before asserting — no wall-clock dependency.
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertTrue(
             chat.messages.contains { $0.role == .assistant && $0.text.contains("MIRRORTEST") },
             "foreign deltas after resume-land must still apply to the adopted stream")
@@ -473,7 +542,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "MIRRORTEST reply", "status": "completed"]))
+        // Deterministic backfill drain: await the Task { await backfill() } that
+        // handleForeignFrame spawns on message.complete — no wall-clock settle().
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertTrue(fetched)
         XCTAssertFalse(chat.isStreaming, "streaming must not be stranded true")
     }
@@ -506,7 +581,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
             "session_id": .string(activeRuntime),
             "payload": ["text": .string("local answer")],
         ]))!)
+        // Deterministic drain: flush the 40ms coalescing buffer so the local
+        // delta lands; isStreaming is already set synchronously by message.start.
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertTrue(chat.isStreaming)
         let rowsBefore = chat.messages.count
         _ = sessions  // silence unused in release
@@ -521,7 +602,8 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "FOREIGN reply", "status": "completed"]))
-        await settle()
+        // All foreign frames are dropped synchronously (local turn owns the stream).
+        await Task.yield()
 
         XCTAssertTrue(chat.isStreaming, "the local turn must keep the stream")
         XCTAssertFalse(backfillCalled, "a foreign complete must not backfill over a live local turn")
@@ -540,7 +622,8 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
             "session_id": .string(activeRuntime),
             "payload": ["text": .string("local answer final"), "status": .string("completed")],
         ]))!)
-        await settle()
+        // handleMessageComplete is synchronous.
+        await Task.yield()
         XCTAssertFalse(chat.isStreaming)
         XCTAssertTrue(chat.messages.contains { $0.role == .assistant && $0.text.contains("local answer") })
     }
@@ -562,14 +645,21 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "first reply", "status": "completed"]))
+        // Deterministic drain: await the foreign-complete backfill Task before
+        // asserting isStreaming (teardown is in the backfill Task body).
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertFalse(chat.isStreaming, "first foreign turn cleared streaming")
 
         // A second, distinct foreign runtime drives the same stored session.
         chat.handle(event: foreignFrame(
             type: "message.start", runtime: "rt-foreign-2", stored: storedId,
             payload: ["role": "assistant"]))
-        await settle()
+        // Adoption (beginStreamingMessage) is synchronous.
+        await Task.yield()
         XCTAssertTrue(chat.isStreaming, "the second foreign turn must be adoptable, not blocked")
         #if DEBUG
         XCTAssertEqual(chat.foreignMirrorTelemetry.foreignAdopted, 2,

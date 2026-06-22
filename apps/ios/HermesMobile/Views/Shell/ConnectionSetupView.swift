@@ -6,6 +6,11 @@ import SwiftUI
 /// any failure inline. On success the phase flips to `.connected` and
 /// ``RootView`` re-renders into the main UI automatically.
 struct ConnectionSetupView: View {
+    /// The connection mode this form is serving. Influences the URL placeholder
+    /// text (Local desktop gets a LAN/loopback hint) and the form title. Does
+    /// NOT change transport behaviour — all modes call `configure(urlString:token:)`.
+    var initialMode: ConnectionMode = .remoteURL
+
     @Environment(ConnectionStore.self) private var connection
     @Environment(ThemeStore.self) private var themeStore
     @Environment(\.hermesTheme) private var theme
@@ -17,6 +22,10 @@ struct ConnectionSetupView: View {
     /// A Tailscale hint surfaced when a connection to a `*.ts.net` host fails;
     /// `nil` clears the banner.
     @State private var tailscaleHint: TailscaleHint?
+    /// Set to `true` when the user taps "Connect" while already paired to a
+    /// gateway — presents the destructive-confirmation alert before proceeding.
+    /// (Inc-4 hardening: a re-connect must not silently swap the gateway.)
+    @State private var showingReplaceConfirmation = false
 
     @FocusState private var focusedField: Field?
 
@@ -29,6 +38,25 @@ struct ConnectionSetupView: View {
         !urlString.trimmingCharacters(in: .whitespaces).isEmpty
             && !token.trimmingCharacters(in: .whitespaces).isEmpty
             && !isConnecting
+    }
+
+    /// URL placeholder text — adapts to the connection mode.
+    private var urlPlaceholder: String {
+        switch initialMode {
+        case .localDesktop:
+            return "http://192.168.x.x:9119"
+        case .remoteURL, .sharedDashboard:
+            return "https://your-mac.tailnet.ts.net:9443"
+        }
+    }
+
+    /// Navigation title — adapts to the connection mode.
+    private var formTitle: String {
+        switch initialMode {
+        case .localDesktop:    return "Local gateway"
+        case .remoteURL:       return "Connect to Hermes"
+        case .sharedDashboard: return "Connect to Hermes"
+        }
     }
 
     var body: some View {
@@ -68,7 +96,7 @@ struct ConnectionSetupView: View {
                     TextField(
                         "Server URL",
                         text: $urlString,
-                        prompt: Text(verbatim: "https://your-mac.tailnet.ts.net:9443")
+                        prompt: Text(verbatim: urlPlaceholder)
                     )
                     .textContentType(.URL)
                     .keyboardType(.URL)
@@ -78,6 +106,10 @@ struct ConnectionSetupView: View {
                     .focused($focusedField, equals: .url)
                     .onSubmit { focusedField = .token }
                     .focusRing(active: focusedField == .url, color: theme.composerRing)
+                    // A11y: placeholder text is not read as a label on all VoiceOver
+                    // configurations; an explicit label guarantees "Gateway URL, text field".
+                    .accessibilityLabel("Gateway URL")
+                    .accessibilityIdentifier("gatewayURLField")
 
                     SecureField("Session token", text: $token)
                         .textContentType(.password)
@@ -87,6 +119,11 @@ struct ConnectionSetupView: View {
                         .focused($focusedField, equals: .token)
                         .onSubmit { if canConnect { connect() } }
                         .focusRing(active: focusedField == .token, color: theme.composerRing)
+                        // A11y: explicit label for SecureField (placeholder alone is
+                        // insufficient when the field is filled — VoiceOver reads the
+                        // secure-entry-replacement bullets, not the placeholder).
+                        .accessibilityLabel("Session token")
+                        .accessibilityIdentifier("sessionTokenField")
                 } header: {
                     Text("Gateway")
                 } footer: {
@@ -141,13 +178,47 @@ struct ConnectionSetupView: View {
             }
             .scrollContentBackground(.hidden)
             .background(theme.bg)
-            .navigationTitle("Connect to Hermes")
+            .navigationTitle(formTitle)
             .navigationBarTitleDisplayMode(.inline)
-            .onAppear { focusedField = .url }
+            .onAppear {
+                focusedField = .url
+                // Persist the mode the user chose before they connect — so if they
+                // dismiss without connecting, the picker still reflects their intent
+                // on the next appearance. configure() does not touch the mode key.
+                connection.connectionMode = initialMode
+            }
             .hermesThemed(themeStore)
+            // Inc-4 hardening: when the user is already paired, confirm before
+            // silently swapping the gateway out from under them. Mirrors the
+            // `pendingPair` alert in RootView (QR/deep-link re-pair path).
+            .alert("Replace current connection?", isPresented: $showingReplaceConfirmation) {
+                Button("Disconnect & Connect", role: .destructive) {
+                    performConnect()
+                }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                if let host = URL(string: connection.serverURLString)?.host(percentEncoded: false),
+                   !host.isEmpty {
+                    Text("This will disconnect from \(host) and pair with the new gateway.")
+                } else {
+                    Text("This will disconnect your current session and pair with the new gateway.")
+                }
+            }
     }
 
     private func connect() {
+        guard canConnect else { return }
+        // If already paired to a gateway, require explicit confirmation before
+        // proceeding — a silent swap is surprising and can drop an active session.
+        if connection.hasConnected {
+            showingReplaceConfirmation = true
+            return
+        }
+        performConnect()
+    }
+
+    /// Performs the actual `configure` call after any confirmation gate has passed.
+    private func performConnect() {
         guard canConnect else { return }
         focusedField = nil
         isConnecting = true

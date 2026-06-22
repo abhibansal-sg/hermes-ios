@@ -184,6 +184,25 @@ final class SessionStore {
     var searchResults: [SessionSearchResult] = []
     /// True while a search request is in flight (after the debounce fires).
     var isSearching: Bool = false
+    /// True while a load-more page fetch is in flight.
+    var isSearchLoadingMore: Bool = false
+    /// `true` when the last fetched page was full (== limit), meaning more
+    /// results may exist. `false` once a short page (< limit) is received or
+    /// when offset would exceed the server cap (500).
+    var searchHasMore: Bool = false
+    /// Current page offset for the active query. Reset to 0 on each new query.
+    /// `internal` (not `private(set)`) so unit tests can prime state directly.
+    var searchOffset: Int = 0
+    /// Monotonically-increasing generation counter. Incremented on every new
+    /// query so a stale load-more page from a prior query can be discarded.
+    /// `internal` for unit-test assertion (SearchPaginationTests).
+    var searchGeneration: Int = 0
+    /// Page size used for both the initial fetch and load-more pages. The stock
+    /// endpoint caps at 100; the plugin does not paginate (offset not forwarded
+    /// there), so this only applies to the stock path.
+    static let searchPageLimit: Int = 20
+    /// Server-enforced offset cap. Requests with offset >= this value return [].
+    static let searchOffsetCap: Int = 500
     /// `true` once `searchQuery` is long enough to be an active search — the view
     /// swaps the normal list for `searchResults` while this holds.
     var isSearchActive: Bool { searchQuery.trimmingCharacters(in: .whitespaces).count >= 2 }
@@ -391,6 +410,49 @@ final class SessionStore {
     /// one entry exists; cancelled when the registry empties.
     private var liveCleanupTask: Task<Void, Never>?
 
+    // MARK: - Turn-in-progress registry
+
+    /// Stored session ids whose turn is currently in flight. A row with a local
+    /// `lastActive` bump is carried forward over a server refresh IFF its id is
+    /// present here — so the carry-forward is gated on a REAL per-turn lifecycle
+    /// event rather than the 10s time-proxy. Cleared by every turn-end path
+    /// (complete/error/cancel/disconnect) so a stuck flag can never revive the
+    /// old infinite-carry-forward bug.
+    /// `@ObservationIgnored` so writes never trigger a drawer invalidation on
+    /// their own; the carry-forward effect lands via `mergeSessionPage`.
+    @ObservationIgnored private var turnsInProgress: Set<String> = []
+
+    /// Mark a turn started for `storedId`. Called by `ConnectionStore` on
+    /// `message.start`. A `nil`/empty id is a no-op.
+    func markTurnStarted(storedId: String?) {
+        guard let id = storedId, !id.isEmpty else { return }
+        turnsInProgress.insert(id)
+    }
+
+    /// Mark a turn completed (or failed/cancelled) for `storedId`. Called by
+    /// `ConnectionStore` on `message.complete`, the gateway `error` terminal,
+    /// and every turn-abort path. A `nil`/empty id is a no-op.
+    func markTurnCompleted(storedId: String?) {
+        guard let id = storedId, !id.isEmpty else { return }
+        turnsInProgress.remove(id)
+    }
+
+    /// Clear ALL in-progress turn flags. Belt-and-suspenders: called on
+    /// disconnect/reconnect so a mid-turn transport drop can never leave a flag
+    /// stuck, which would revive the infinite-carry-forward bug.
+    func clearAllTurnsInProgress() {
+        turnsInProgress.removeAll()
+    }
+
+    #if DEBUG
+    /// Test-only: the set of stored session ids currently flagged as having a
+    /// turn in flight. Exposed so wiring tests can assert that every abandon path
+    /// (socket drop, foreground-reconnect `dead` branch, dead-probe branch) leaves
+    /// the set empty — proving the anti-stuck-flag invariant without relying on
+    /// carry-forward timing.
+    var turnsInProgressIds: Set<String> { turnsInProgress }
+    #endif
+
     private var connection: ConnectionStore?
     private var chat: ChatStore?
 
@@ -493,6 +555,22 @@ final class SessionStore {
 
     /// Debounce handle for `.searchable` input → search fetch.
     private var searchTask: Task<Void, Never>?
+    /// In-flight load-more handle. At most one load-more runs at a time.
+    private var searchLoadMoreTask: Task<Void, Never>?
+
+    #if DEBUG
+    /// Injectable search fetch for unit tests. When set, replaces the live
+    /// `fetchSearch(query:offset:api:)` call in both `searchQueryChanged` and
+    /// `loadMoreSearchResults` — mirrors the `sessionsFetch` / `transcriptFetch`
+    /// seam pattern so tests drive the real Task-based methods without a gateway.
+    ///
+
+    /// Signature: `(query, offset) async throws -> (results, rawPageFull)`.
+    /// `rawPageFull` must reflect whether the raw (pre-collapse for plugin, direct
+    /// for stock) server page was full — callers use it to determine whether more
+    /// pages may exist via `searchHasMore`.
+    var searchFetch: ((String, Int) async throws -> ([SessionSearchResult], Bool))?
+    #endif
 
     /// In-flight transcript prefetch sweep (WhatsApp bar — coverage). Cancelled on
     /// disconnect/background so a paced background fetch never outlives the
@@ -546,29 +624,44 @@ final class SessionStore {
 
     /// A ``RestClient`` for the session-management endpoints (search / rename /
     /// archive / export — now ``RestClient`` extension members), resolved from the
-    /// active connection. The token comes from the dev env override first
-    /// (`HERMES_TOKEN`, which never touches the Keychain) and the Keychain second,
-    /// mirroring how ``ConnectionStore`` bootstraps a connection.
+    /// active connection's live token via ``ConnectionStore/rest``.
+    ///
+
+    /// this previously re-read ``KeychainService/loadToken(server:)``
+    /// directly, creating a second token source that could diverge from
+    /// ``ConnectionStore/currentToken`` (the authoritative in-memory token).
+    /// Divergence scenarios: a re-pair that wrote `currentToken` before the
+    /// Keychain item was updated, a device-token upgrade whose Keychain write
+    /// failed (the `try?` path in ``ConnectionStore/configure(_:token:…)``), or
+    /// a simulator reinstall that cleared UserDefaults but left a stale Keychain
+    /// item. In all cases `SessionStore.restAPI` sent the stale/wrong token on
+    /// REST calls and received HTTP 401, while everything routed through
+    /// `connection.rest` / `currentToken` worked (including the WS auth and the
+    /// transcript-fetch paths that correctly used `connection?.rest`).
+    ///
+
+    /// Fix: source the token from the single authoritative live path
+    /// (`ConnectionStore.rest`) so there is only one token source. The
+    /// HERMES_TOKEN dev-env override is already handled: `ConnectionStore.bootstrap`
+    /// reads it and calls `configure()` with it, setting `currentToken` from the
+    /// env value, so `connection?.rest` returns a client carrying the env token.
+    /// Cold-launch safety is preserved: before `configure()` succeeds,
+    /// `ConnectionStore.rest` returns `nil` exactly as the old Keychain read did
+    /// (before any token existed), so callers' nil-guard / "Not connected." paths
+    /// are unchanged.
     private var restAPI: RestClient? {
-        guard let connection else { return nil }
-        let urlString = connection.serverURLString
-        guard !urlString.isEmpty, let url = URL(string: urlString), url.scheme != nil else {
-            return nil
-        }
-        let env = ProcessInfo.processInfo.environment
-        let token: String?
-        if let envURL = env["HERMES_URL"], envURL == urlString,
-           let envToken = env["HERMES_TOKEN"], !envToken.isEmpty {
-            token = envToken
-        } else {
-            token = KeychainService.loadToken(server: urlString)
-        }
-        guard let token, !token.isEmpty else { return nil }
-        return RestClient(
-            baseURL: url, token: token,
-            pathStyle: connection.capabilities.resolvedPathStyle
-        )
+        connection?.rest
     }
+
+    #if DEBUG
+    /// DEBUG-only test accessor: the token string that ``restAPI`` would use for
+    /// the next session-management REST call, or `nil` when there is no live
+    /// connection. Exposed so regression tests can assert the single-source-of-truth
+    /// invariant without going through a real network call — the value
+    /// equals ``ConnectionStore/rest``'s token, which is the authoritative
+    /// in-memory ``ConnectionStore/currentToken``.
+    var restAPITokenForTesting: String? { restAPI?.token }
+    #endif
 
     // MARK: - Derived list slices
 
@@ -1134,23 +1227,22 @@ final class SessionStore {
         let priorLastActive: [String: Double] = sessions.reduce(into: [:]) { acc, s in
             if let la = s.lastActive { acc[s.id] = la }
         }
-        // gate the carry-forward on the LIVE WINDOW. `noteActivity`
-        // bumps `lastActive` to the DEVICE clock; if the device runs even slightly
-        // ahead of the gateway, an UNCONDITIONAL `max(local, server)` pins that
-        // device-now value above the row's true server `lastActive` FOREVER —
-        // nothing ever advances the server value past a future-dated bump — so an
-        // idle local session permanently outranks a genuinely-fresher foreign
-        // (desktop-driven) one AND displays a stale (future) timestamp. Both the
-        // drawer SORT and the row TIMESTAMP key on `lastActive`, so this one defect
-        // produced both reported symptoms. `lastActivityAt[id]` is re-stamped on
-        // every live frame (ConnectionStore.scheduleSessionRefresh), so a row that
-        // is genuinely mid-turn keeps its optimistic position (no flicker), and the
-        // instant the turn settles the bump DECAYS to the authoritative server
-        // value — restoring correct recency order and the true last-active time.
-        let liveCutoff = Date().addingTimeInterval(-Self.liveWindow)
+        // gate the carry-forward on an EXPLICIT per-turn flag
+        // (turnsInProgress) instead of the 10s liveWindow time-proxy. The
+        // time-proxy worked well for the common case (frequent delta frames keep
+        // lastActivityAt fresh) but opened a residual flicker window when a turn
+        // had a >liveWindow silent inter-frame gap: the carry-forward decayed mid-turn
+        // and a refresh would temporarily drop the row to server authority. The
+        // explicit flag is toggled on message.start (set) and cleared on every
+        // turn-end path: message.complete, gateway error, user cancel, and — as a
+        // belt-and-suspenders — disconnect/reconnect (clearAllTurnsInProgress).
+        // That final path ensures a mid-turn socket drop can NEVER leave the flag
+        // stuck, which would bring back the infinite-carry-forward bug.
+        // NOTE: `lastActivityAt` / `liveWindow` are PRESERVED for the live-dot
+        // (the pulsing row indicator) — only this carry-forward gate has changed.
         let reconciled = incoming.map { row -> SessionSummary in
             guard let prior = priorLastActive[row.id],
-                  let liveAt = lastActivityAt[row.id], liveAt > liveCutoff,
+                  turnsInProgress.contains(row.id),
                   prior > (row.lastActive ?? -.greatestFiniteMagnitude) else { return row }
             var bumped = row
             bumped.lastActive = prior
@@ -1570,6 +1662,26 @@ final class SessionStore {
     /// superseded open (the user tapped another session) checks it and bails.
     private var openToken = UUID()
 
+    #if DEBUG
+    /// DEBUG-only handle to the most recent open-seed Task. Stored so tests can
+    /// `await` it without depending on wall-clock `settle()`. Set by `open()`
+    /// before the seed Task is spawned; `nil` when no open is in flight.
+    /// Never compiled into Release.
+    private(set) var lastOpenSeedTask: Task<Void, Never>?
+
+    /// DEBUG-only: await the most recently spawned open-seed Task, then yield
+    /// once so any main-actor mutations it enqueued have a chance to propagate.
+    /// Call this in tests INSTEAD OF (or after) `settle()` to deterministically
+    /// wait for the seed to land without a wall-clock timeout.
+    func waitForPendingOpenForTesting() async {
+        await lastOpenSeedTask?.value
+        // One additional cooperative yield so `@Observable` write propagations
+        // that happen synchronously inside the seed Task's final await have
+        // settled before the test asserts.
+        await Task.yield()
+    }
+    #endif
+
     /// - Parameter revealOnFirstPaint: SMOOTHNESS R40 (Defect: "the transcript
     ///  moves before the chat-view layer on close"). When the drawer hands off a
     ///  row tap it passes its close here instead of firing it itself. We invoke
@@ -1634,11 +1746,14 @@ final class SessionStore {
         // session's rows can't linger), which is the state ChatView renders as the
         // skeleton/placeholder until the network seed lands. The deferred network
         // fetch then reconciles in place over either starting point.
-        Task { [weak self] in
+        let seedTask = Task { [weak self] in
             guard let self, self.openToken == token else { return }
             await self.seedTranscriptCacheFirst(
                 storedId: summary.id, token: token, onFirstPaint: revealOnFirstPaint)
         }
+        #if DEBUG
+        lastOpenSeedTask = seedTask
+        #endif
 
         // Slow path: gateway resume — spins up the agent server-side; only
         // prompt submission depends on it.
@@ -2068,21 +2183,44 @@ final class SessionStore {
     // MARK: - Search
 
     /// React to a change in `searchQuery` from the `.searchable` field. Debounces
-    /// 300ms, then fetches `/api/sessions/search`; queries under two characters
-    /// clear the results immediately. Call from the view's `onChange(of:)`.
+    /// 300ms, then tries the plugin endpoint first with graceful fallback to the
+    /// stock `/api/sessions/search` on 404 (older gateways without the plugin).
+    /// Queries under two characters clear the results immediately.
+    /// Call from the view's `onChange(of:)`.
     func searchQueryChanged() {
         searchTask?.cancel()
+        // Cancel any in-flight load-more from the previous query.
+        searchLoadMoreTask?.cancel()
+        searchLoadMoreTask = nil
 
         let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else {
             searchResults = []
             isSearching = false
+            searchOffset = 0
+            searchHasMore = false
             return
         }
+        #if DEBUG
+        let apiOrNil: RestClient? = restAPI
+        // Allow the seam to bypass the restAPI requirement in tests.
+        guard apiOrNil != nil || searchFetch != nil else {
+            searchResults = []
+            return
+        }
+        #else
         guard let api = restAPI else {
             searchResults = []
             return
         }
+        #endif
+
+        // Reset pagination state for the new query and bump the generation so
+        // any stale load-more page from the prior query is discarded on arrival.
+        searchOffset = 0
+        searchHasMore = false
+        searchGeneration &+= 1
+        let generation = searchGeneration
 
         searchTask = Task { [weak self] in
             // Debounce.
@@ -2092,15 +2230,33 @@ final class SessionStore {
             self.isSearching = true
             defer { self.isSearching = false }
             do {
-                let results = try await api.searchSessions(
-                    query: trimmed, scope: self.searchScope.rawValue
-                )
-                if Task.isCancelled { return }
-                // Guard against a stale response landing after the user typed on.
-                guard self.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed else {
+                #if DEBUG
+                let (results, rawPageFull): ([SessionSearchResult], Bool)
+                if let seam = self.searchFetch {
+                    (results, rawPageFull) = try await seam(trimmed, 0)
+                } else if let api = apiOrNil {
+                    (results, rawPageFull) = try await self.fetchSearch(
+                        query: trimmed, offset: 0, api: api
+                    )
+                } else {
                     return
                 }
+                #else
+                let (results, rawPageFull) = try await self.fetchSearch(
+                    query: trimmed, offset: 0, api: api
+                )
+                #endif
+                if Task.isCancelled { return }
+                // Guard against a stale response landing after the user typed on.
+                guard self.searchGeneration == generation else { return }
                 self.searchResults = results
+                // Advance offset by the page limit (not collapsed count) so
+                // the next load-more request starts at the correct message offset.
+                self.searchOffset = Self.searchPageLimit
+                // rawPageFull: true when the raw (pre-collapse for plugin, direct
+                // for stock) server page was full — more messages may exist.
+                self.searchHasMore = rawPageFull
+                    && self.searchOffset < Self.searchOffsetCap
                 self.lastError = nil
             } catch {
                 if Task.isCancelled { return }
@@ -2108,6 +2264,124 @@ final class SessionStore {
                 self.lastError = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
             }
+        }
+    }
+
+    /// Append the next page of search results for the active query.
+    ///
+
+    /// No-op when: already loading more, last page was short, offset has reached
+    /// the server cap, or no active query. Guards against stale pages from a
+    /// prior query via the `searchGeneration` counter.
+    func loadMoreSearchResults() {
+        guard searchHasMore,
+              !isSearchLoadingMore,
+              !isSearching,
+              searchOffset < Self.searchOffsetCap else { return }
+        #if DEBUG
+        let apiForMore: RestClient? = restAPI
+        guard apiForMore != nil || searchFetch != nil else { return }
+        #else
+        guard let api = restAPI else { return }
+        #endif
+        let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return }
+        let offset = searchOffset
+        let generation = searchGeneration
+
+        searchLoadMoreTask?.cancel()
+        searchLoadMoreTask = Task { [weak self] in
+            guard let self else { return }
+            self.isSearchLoadingMore = true
+            defer { self.isSearchLoadingMore = false }
+            do {
+                #if DEBUG
+                let (page, rawPageFull): ([SessionSearchResult], Bool)
+                if let seam = self.searchFetch {
+                    (page, rawPageFull) = try await seam(trimmed, offset)
+                } else if let api = apiForMore {
+                    (page, rawPageFull) = try await self.fetchSearch(
+                        query: trimmed, offset: offset, api: api
+                    )
+                } else {
+                    return
+                }
+                #else
+                let (page, rawPageFull) = try await self.fetchSearch(
+                    query: trimmed, offset: offset, api: api
+                )
+                #endif
+                if Task.isCancelled { return }
+                // Discard if the user changed the query while this was in flight.
+                guard self.searchGeneration == generation else { return }
+                // Append, deduplicating by session id — handles same session
+                // appearing in two message-pages (plugin) or window shift (stock).
+                let existingIds = Set(self.searchResults.map(\.id))
+                let fresh = page.filter { !existingIds.contains($0.id) }
+                self.searchResults.append(contentsOf: fresh)
+                // Advance by the page limit (not collapsed count) so the next
+                // load-more starts at the correct message-level offset.
+                self.searchOffset = offset + Self.searchPageLimit
+                // rawPageFull drives has-more: a full raw page means the server
+                // may have more messages, even if collapse produced few sessions.
+                self.searchHasMore = rawPageFull
+                    && self.searchOffset < Self.searchOffsetCap
+            } catch {
+                if Task.isCancelled { return }
+                // Leave existing results intact; a load-more failure is silent
+                // (the user can scroll back up and the list is still readable).
+            }
+        }
+    }
+
+    /// Execute the search against the best available endpoint: plugin first (richer
+    /// results + role-scoped + offset pagination), stock on 404 (older gateways).
+    /// Only falls back on a true 404/not-found — real 500/transport errors are
+    /// re-thrown so they surface as `lastError` and are not silently masked.
+    ///
+
+    /// `offset` is forwarded to both the plugin and stock endpoints.
+    ///
+
+    /// Returns `(results, rawPageFull)` where `rawPageFull` indicates whether the
+    /// underlying server page was full at the message level (for plugin) or session
+    /// level (for stock). Callers use `rawPageFull` to set `searchHasMore` — this
+    /// correctly handles plugin pages that collapse to fewer sessions than the raw
+    /// message limit but still have more messages to return.
+    ///
+
+    /// Extracted so tests can call it directly without spinning a Task.
+    func fetchSearch(
+        query: String, offset: Int = 0, api: RestClient
+    ) async throws -> (results: [SessionSearchResult], rawPageFull: Bool) {
+        let roles = Self.roles(for: searchScope)
+        do {
+            // Plugin path: forward offset so load-more fetches subsequent
+            // message pages. rawPageFull keys on the raw (pre-collapse) count.
+            let (results, rawPageFull) = try await api.searchSessionsPlugin(
+                query: query, limit: Self.searchPageLimit, offset: offset, roles: roles
+            )
+            return (results, rawPageFull)
+        } catch RestError.badStatus(404, _) {
+            // Plugin endpoint not available on this gateway — fall back to stock.
+            let results = try await api.searchSessions(
+                query: query, limit: Self.searchPageLimit, offset: offset,
+                scope: searchScope.rawValue
+            )
+            // Stock path: rawPageFull = full session page (no pre-collapse step).
+            return (results, results.count == Self.searchPageLimit)
+        }
+        // Any other error (500, transport, decode) propagates to the caller.
+    }
+
+    /// Map the UI search scope to a list of `role` values for the plugin endpoint.
+    /// `all` sends no filter (server returns every role); `messages` returns user +
+    /// assistant prose; `code` returns tool output.
+    static func roles(for scope: SearchScope) -> [String] {
+        switch scope {
+        case .all:      return []
+        case .messages: return ["user", "assistant"]
+        case .code:     return ["tool"]
         }
     }
 
@@ -2125,13 +2399,18 @@ final class SessionStore {
         open(summary)
     }
 
-    /// Cancel any in-flight search and reset the search UI state.
+    /// Cancel any in-flight search (and load-more) and reset the search UI state.
     func clearSearch() {
         searchTask?.cancel()
         searchTask = nil
+        searchLoadMoreTask?.cancel()
+        searchLoadMoreTask = nil
         searchQuery = ""
         searchResults = []
         isSearching = false
+        isSearchLoadingMore = false
+        searchHasMore = false
+        searchOffset = 0
     }
 
     // MARK: - Pins

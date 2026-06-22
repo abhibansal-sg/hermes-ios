@@ -668,7 +668,7 @@ final class ChatStore {
             // records the placeholder id in `pendingForeignReconcileID`; the seed's
             // `reconcileMessages` consumes it.
             teardownForeignStream(preservePlaceholderForReconcile: true)
-            Task {
+            let backfillTask = Task {
                 await self.backfill()
                 // A foreign-mirrored turn ending is a turn completion too: the
                 // stored session just went idle, so let the queue drain into it
@@ -679,6 +679,9 @@ final class ChatStore {
                 // would discard the mirror's reconciled text).
                 self.onTurnComplete?()
             }
+            #if DEBUG
+            lastForeignBackfillTask = backfillTask
+            #endif
             // The REST backfill is the authoritative reconcile for a mirrored turn;
             // we do not also run the frame through `handleMessageComplete` (which
             // would mutate a now torn-down streaming message).
@@ -1400,6 +1403,53 @@ final class ChatStore {
         flushBuffers()
     }
 
+    #if DEBUG
+    /// DEBUG-only deterministic drain hook for unit tests.
+    ///
+
+    /// Cancels the pending 40ms coalescing Task and calls the SAME `flushBuffers()`
+    /// the production path would call — guaranteeing the buffered text/thinking is
+    /// applied to `messages` synchronously, with no wall-clock dependency.
+    ///
+
+    /// Zero production-behavior change: the method is `#if DEBUG`-gated and only
+    /// force-runs logic that already runs in production (on the flush Task's
+    /// natural firing). Never compiled into Release.
+    func drainFlushForTesting() {
+        flushTask?.cancel()
+        flushTask = nil
+        flushBuffers()
+    }
+
+    /// DEBUG-only handle to the most recent foreign-complete backfill Task.
+    /// Stored by `handleForeignFrame` when a foreign `message.complete` (or
+    /// `error`) fires the `Task { await backfill() }`. Tests await this to
+    /// deterministically wait for the REST reconcile without wall-clock settle().
+    /// Never compiled into Release.
+    private(set) var lastForeignBackfillTask: Task<Void, Never>?
+
+    /// DEBUG-only: await the most recently spawned foreign-backfill Task, then
+    /// yield once so any main-actor mutations have propagated before assertions.
+    func waitForPendingForeignBackfillForTesting() async {
+        await lastForeignBackfillTask?.value
+        await Task.yield()
+    }
+
+    /// DEBUG-only handle to the most recent `mergeForeignUserRows` Task.
+    /// Stored by `mergeForeignUserRows()` when a foreign `message.start` fires
+    /// the start-time user-bubble fetch. Tests await this to deterministically
+    /// wait for the user row to land without wall-clock settle().
+    /// Never compiled into Release.
+    private(set) var lastForeignUserRowMergeTask: Task<Void, Never>?
+
+    /// DEBUG-only: await the most recently spawned foreign user-row merge Task,
+    /// then yield once so any main-actor mutations have propagated before assertions.
+    func waitForPendingForeignUserRowMergeForTesting() async {
+        await lastForeignUserRowMergeTask?.value
+        await Task.yield()
+    }
+    #endif
+
     // MARK: - Streaming-message mutation helpers
 
     /// Apply `transform` to the current streaming message in place.
@@ -1694,6 +1744,101 @@ final class ChatStore {
     /// runtime when one is live, else the local active session. Factored out
     /// so the routing fact is directly assertable in tests.
     var interruptTarget: String? { mirroringRuntimeId ?? activeSessionId }
+
+    // MARK: - Steer
+
+    /// Outcome of a `session.steer` RPC call.
+    ///
+
+    /// - `queued`: the gateway accepted the steering text and will inject it
+    ///  into the running turn's next context window.
+    /// - `rejected`: the gateway declined (e.g. turn already completing or the
+    ///  session is not currently streaming). The UI should keep the text so the
+    ///  user can queue it instead.
+    /// - `error(String)`: transport or RPC failure; the message is also written
+    ///  to `lastError` for the standard error-banner path.
+    enum SteerOutcome: Equatable, Sendable {
+        case queued
+        case rejected
+        case error(String)
+    }
+
+    /// Gateway response shape for `session.steer`.
+    struct SessionSteerResponse: Decodable, Sendable {
+        let status: String
+        /// Optional human-readable note from the gateway (not currently surfaced
+        /// in UI but preserved for future diagnostic use).
+        let text: String?
+    }
+
+    #if DEBUG
+    /// Injectable hook for tests — replaces the live `session.steer` RPC when
+    /// set. `nil` in production (inert). Receives `(sessionId, trimmedText)` and
+    /// returns the response that `steer(text:)` maps to a `SteerOutcome`.
+    ///
+
+    /// Pattern mirrors `ConnectionStore.connectRPC` (the reconnect-test seam).
+    var steerRPC: ((_ sessionId: String, _ text: String) async throws -> SessionSteerResponse)?
+    #endif
+
+    /// Inject steering text into the turn that owns the VISIBLE stream
+    /// (`session.steer`).
+    ///
+
+    /// Routing follows ``interrupt()`` exactly: an adopted foreign mirror streams
+    /// from its OWN runtime, so `interruptTarget` (= `mirroringRuntimeId ??
+    /// activeSessionId`) is the correct target — NOT `activeSessionId` alone,
+    /// which would miss a foreign turn or be `nil` during the resume window.
+    ///
+
+    /// This is fire-and-forget from the iOS client's perspective: the gateway
+    /// owns the running turn and decides whether to accept the steer text. iOS
+    /// MUST NOT call `beginLocalTurn`, `setStreaming`, or `cancelStreaming` — the
+    /// turn's streaming context is entirely server-managed.
+    ///
+
+    /// - Returns: `.queued` if accepted, `.rejected` if the gateway declined,
+    ///  `.error` on transport/RPC failure (also sets `lastError`).
+    func steer(text: String) async -> SteerOutcome {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .rejected }
+        guard let client, let sessionId = interruptTarget else {
+            return .error("No active session")
+        }
+        do {
+            let response: SessionSteerResponse
+            #if DEBUG
+            if let hook = steerRPC {
+                response = try await hook(sessionId, trimmed)
+            } else {
+                response = try await client.request(
+                    "session.steer",
+                    params: .object(["session_id": .string(sessionId),
+                                     "text": .string(trimmed)])
+                )
+            }
+            #else
+            response = try await client.request(
+                "session.steer",
+                params: .object(["session_id": .string(sessionId),
+                                 "text": .string(trimmed)])
+            )
+            #endif
+            switch response.status {
+            case "queued":   return .queued
+            case "rejected": return .rejected
+            default:
+                // Defensive: unknown status from a future gateway version is
+                // treated as a soft rejection — don't clear the user's text.
+                return .rejected
+            }
+        } catch {
+            let msg = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            lastError = msg
+            return .error(msg)
+        }
+    }
 
     /// Answer a pending approval (`approval.respond`) and clear it.
     func respondApproval(approve: Bool, all: Bool) async {
@@ -2552,7 +2697,7 @@ final class ChatStore {
     /// corrupt the live assistant stream.
     private func mergeForeignUserRows() {
         guard streamingIsForeign, let storedId = sessions?.activeStoredId else { return }
-        Task { [weak self] in
+        let mergeTask = Task { [weak self] in
             guard let self else { return }
             guard let fetch = self.resolvedBackfillFetch else { return }
             guard let stored = try? await fetch(storedId) else { return }
@@ -2576,6 +2721,9 @@ final class ChatStore {
             }
             self.rebuildUserOrdinals()
         }
+        #if DEBUG
+        lastForeignUserRowMergeTask = mergeTask
+        #endif
     }
 
     // MARK: - Reset

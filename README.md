@@ -53,7 +53,7 @@ From the root of your `hermes-agent` checkout:
 
 ```bash
 # 1. Clone this repo and run the installer against your hermes-agent checkout
-#    (additive — stock files are only extended; add --dry-run to preview).
+#  (additive — stock files are only extended; add --dry-run to preview).
 git clone https://github.com/ab0991-oss/hermes-ios.git
 hermes-ios/dist/hermes-mobile/install.sh  /path/to/your/hermes-agent
 

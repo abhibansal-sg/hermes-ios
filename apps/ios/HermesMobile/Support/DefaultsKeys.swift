@@ -93,6 +93,13 @@ enum DefaultsKeys {
     /// token is unchanged. Owned by ``PushRegistrar``.
     static let pushLastEvents = "hermes.push.lastEvents"
 
+    /// `String` — the APNs environment (`"sandbox"` / `"production"`) under which
+    /// the last successful registration was issued. Added to the dedupe key so that
+    /// a sandbox→production transition (Xcode → TestFlight on the same token) forces
+    /// a re-POST and the gateway routes the token to the correct APNs host. Owned by
+    /// ``PushRegistrar``.
+    static let pushLastEnv = "hermes.push.lastEnv"
+
     /// `Bool` — whether notification authorization has already been requested once,
     /// so the prompt isn't re-shown. Owned by ``NotificationService``.
     static let notificationsDidRequestAuthorization =
@@ -281,6 +288,21 @@ enum DefaultsKeys {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let raw, !raw.isEmpty else { return nil }
         return raw
+    }
+
+    // MARK: Connection mode (Increment 1 — Topology B)
+
+    /// `String` (raw value of `ConnectionMode`) — the chosen connection mode.
+    /// Absent/unrecognised values fall back to `.remoteURL` (the legacy default:
+    /// the URL+token form the app already uses for all pairing). Owned by
+    /// ``ConnectionStore``.
+    static let connectionMode = "hermes.connectionMode"
+
+    /// Read + decode the persisted ``ConnectionMode``. Returns `.remoteURL` when
+    /// unset (existing installs keep the existing behaviour unchanged).
+    static func connectionModeValue(_ defaults: UserDefaults = .standard) -> ConnectionMode {
+        let raw = defaults.string(forKey: connectionMode) ?? ""
+        return ConnectionMode(rawValue: raw) ?? .remoteURL
     }
 
 }

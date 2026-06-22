@@ -49,6 +49,12 @@ struct ComposerView: View {
     /// the send and queue feedbacks distinct without sharing a single trigger.
     @State private var sendFeedbackTrigger = 0
     @State private var queueFeedbackTrigger = 0
+    /// Incremented on each steer attempt to drive `.sensoryFeedback`.
+    @State private var steerFeedbackTrigger = 0
+    /// Transient status note shown below the queue chip after a steer attempt:
+    /// "Steered" on `.queued`, "Turn ending — queued instead" on `.rejected`,
+    /// cleared after 2 s. `nil` = no note shown.
+    @State private var steerNote: String?
 
     /// The photo-library picker selection (loaded as Data, converted to JPEG).
     @State private var photoItem: PhotosPickerItem?
@@ -156,6 +162,15 @@ struct ComposerView: View {
             if !queueStore.items.isEmpty {
                 queueChip
             }
+            // Transient steer-outcome note (auto-clears after 2 s).
+            if let steerNote {
+                Text(steerNote)
+                    .font(.caption)
+                    .foregroundStyle(theme.mutedFg)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.opacity)
+                    .accessibilityIdentifier("steerNote")
+            }
             if attachmentStore.hasPending {
                 attachmentStrip
             }
@@ -181,6 +196,7 @@ struct ComposerView: View {
         .animation(.easeInOut(duration: 0.16), value: activeMention != nil)
         .animation(.easeInOut(duration: 0.18), value: isCapturing)
         .animation(.easeInOut(duration: 0.18), value: queueStore.items.count)
+        .animation(.easeInOut(duration: 0.18), value: steerNote)
         .animation(.snappy(duration: 0.16), value: holdActive)
         // Session hot-swap picker — a half-height sheet (drag up to full,
         // like the Inbox) anchored to the composer chip. Sends config.set with
@@ -396,6 +412,8 @@ struct ComposerView: View {
         .sensoryFeedback(.impact(flexibility: .soft, intensity: 0.8), trigger: sendFeedbackTrigger)
         // Queue haptic — lighter than send; enqueue is transient, not final.
         .sensoryFeedback(.impact(flexibility: .rigid, intensity: 0.5), trigger: queueFeedbackTrigger)
+        // Steer haptic — same weight as queue (also transient, fire-and-forget).
+        .sensoryFeedback(.impact(flexibility: .rigid, intensity: 0.5), trigger: steerFeedbackTrigger)
     }
 
     /// Row 2: attach ("+"), the model chip, a spacer, the mic glyph, and the
@@ -747,13 +765,28 @@ struct ComposerView: View {
     @ViewBuilder
     private var streamingAction: some View {
         if canQueue {
-            Button {
-                enqueue()
+            // While the agent is streaming AND the user has typed text, present
+            // BOTH paths: "Steer now" (inject into the live turn) and "Queue
+            // for after" (enqueue for drain on completion). A `Menu` on the
+            // queue glyph keeps the action-circle layout unchanged; the user
+            // long-presses or taps to pick.
+            Menu {
+                Button {
+                    steer()
+                } label: {
+                    Label("Steer now", systemImage: "arrow.triangle.branch")
+                }
+                Button {
+                    enqueue()
+                } label: {
+                    Label("Queue for after", systemImage: "text.badge.plus")
+                }
             } label: {
                 actionGlyph("text.badge.plus", filled: true, tint: theme.fg, enabled: true)
             }
+            .menuStyle(.button)
             .buttonStyle(ActionCircleButtonStyle())
-            .accessibilityLabel("Queue message")
+            .accessibilityLabel("Queue or steer message")
         } else {
             Button {
                 Task { await chatStore.interrupt() }
@@ -839,6 +872,40 @@ struct ComposerView: View {
         queueStore.enqueue(trimmed, storedSessionId: sessions.activeStoredId)
         queueFeedbackTrigger &+= 1
         text = ""
+    }
+
+    /// Send the current text as a steering injection into the live turn.
+    ///
+
+    /// On `.queued` — the gateway accepted it: clear the field and show a
+    /// transient "Steered" note (auto-dismissed after 2 s).
+    /// On `.rejected` — the turn was ending or not accepting steers: keep the
+    /// text so the user can choose to queue it instead; show a note explaining.
+    /// On `.error` — surface the error note; text stays.
+    private func steer() {
+        guard canQueue else { return }
+        let textToSteer = trimmed
+        steerFeedbackTrigger &+= 1
+        Task {
+            let outcome = await chatStore.steer(text: textToSteer)
+            switch outcome {
+            case .queued:
+                text = ""
+                showSteerNote("Steered into current turn")
+            case .rejected:
+                showSteerNote("Turn ending — queue it instead")
+            case .error(let msg):
+                showSteerNote(msg)
+            }
+        }
+    }
+
+    private func showSteerNote(_ note: String) {
+        steerNote = note
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            if steerNote == note { steerNote = nil }
+        }
     }
 
     // MARK: - Voice dictation
@@ -1303,6 +1370,11 @@ private struct QueueSheet: View {
                                 queueStore.remove(id: queueStore.items[index].id)
                             }
                         }
+                        // Drag-to-reorder: tapping the EditButton (leading toolbar)
+                        // shows grab handles; releasing persists the new order.
+                        .onMove { source, destination in
+                            queueStore.move(fromOffsets: source, toOffset: destination)
+                        }
                     }
                     .scrollContentBackground(.hidden)
                     .background(theme.bg)
@@ -1313,6 +1385,10 @@ private struct QueueSheet: View {
             .navigationTitle("Queued (\(queueStore.items.count))")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                // EditButton toggles the List's edit mode so drag handles appear.
+                ToolbarItem(placement: .topBarLeading) {
+                    EditButton()
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }

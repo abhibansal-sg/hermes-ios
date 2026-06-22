@@ -85,14 +85,73 @@ final class LiveActivityManager {
     /// Stale horizon for live frames: if neither local events nor
     /// server pushes refresh the activity within this window, ActivityKit
     /// marks it stale — so a frame orphaned by a dead app/server can't sit on
-    /// the Dynamic Island as a fresh-looking "Thinking" forever. Generous
-    /// enough that any genuinely-running turn (whose every event refreshes the
-    /// horizon) never goes stale.
-    private static let staleAfter: TimeInterval = 15 * 60
+    /// the Dynamic Island as a fresh-looking "Thinking" forever.
+    ///
+
+    /// SAFE to be short: this is a per-frame rolling window, NOT
+    /// a max-age. Every live-turn event (`update(toolName:)`, `markNeedsApproval()`,
+    /// etc.) pushes a new `ActivityContent(staleDate: now + staleAfter)`, so a
+    /// genuinely-running turn refreshes the horizon on every frame and never stales.
+    /// The window only expires after REAL silence — the orphaned-activity case.
+    /// 5 min clears ghost "Thinking" activities ~3× faster than 15 min.
+    ///
+
+    /// `internal` (not `private`) so unit tests can assert the threshold value
+    /// without needing ActivityKit.
+    static let staleAfter: TimeInterval = 5 * 60
     /// Stale horizon for the terminal "Done" frame: just past the dismissal
     /// grace, as a belt against the finish itself being lost.
     private static let endStaleAfter: TimeInterval = 30
     #endif
+
+    // MARK: - Orphan reconciliation
+
+    /// Pure-function decision: should an orphaned activity be ended?
+    ///
+
+    /// Factored out of the call site so it is unit-testable WITHOUT ActivityKit
+    /// (ActivityKit cannot run in the unit-test host). Mirrors the pattern used
+    /// by `NotificationService.approveChoice` / `decodeTap`.
+    ///
+
+    /// - Parameters:
+    ///  - hasActiveTurn: the caller's best knowledge of whether a gateway turn
+    ///  is currently in-progress. When `true` the activity is NOT orphaned;
+    ///  ending it would cut short a live turn. This guard makes teardown
+    ///  STRICTLY ADDITIVE — it can only end an already-orphaned activity.
+    ///  - isLive: whether the manager currently tracks a running activity.
+    ///
+
+    /// - Returns: `true` when the activity should be ended (it is live AND there
+    ///  is no active gateway turn to justify it).
+    nonisolated static func shouldEndOrphan(hasActiveTurn: Bool, isLive: Bool) -> Bool {
+        isLive && !hasActiveTurn
+    }
+
+    /// End the running activity if it is orphaned (no active gateway turn).
+    ///
+
+    /// Safe to call when no activity is running — `end()` is already idempotent.
+    /// The `hasActiveTurn` guard is the only safety property that matters: when
+    /// it is `true` this is a no-op, so a correct caller can NEVER end a live turn.
+    func endIfOrphaned(hasActiveTurn: Bool) {
+        #if canImport(ActivityKit)
+        let live = activity != nil || pendingEnd != nil
+        guard Self.shouldEndOrphan(hasActiveTurn: hasActiveTurn, isLive: live) else { return }
+        end()
+        #endif
+    }
+
+    /// Reconcile the live activity state on a foreground event.
+    ///
+
+    /// Called from `ConnectionStore.handleScenePhase` on every foreground, both
+    /// when the socket is healthy (liveness probe passed) and after a dead-socket
+    /// detection by `probeLiveness`. `hasActiveTurn` is the caller's authoritative
+    /// view of whether a gateway turn is in progress.
+    func reconcile(hasActiveTurn: Bool) {
+        endIfOrphaned(hasActiveTurn: hasActiveTurn)
+    }
 
     // MARK: - Lifecycle
 

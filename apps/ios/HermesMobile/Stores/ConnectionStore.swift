@@ -68,6 +68,27 @@ final class ConnectionStore {
     #endif
     var serverURLString: String = ""
 
+    /// The active connection mode (persisted in UserDefaults alongside
+    /// ``serverURLString``). Defaults to `.remoteURL` for existing installs
+    /// (no-migration).
+    ///
+
+    /// **Inc 2 — observed stored property:** promoted from a computed
+    /// UserDefaults pass-through to a `@Observable`-tracked stored property
+    /// so that views bind to it live and `configure`/reconnect always reads the
+    /// current mode at call-time (the old computed getter was not observed by
+    /// `@Observable`, causing a stale-mode connect when the transport now
+    /// branches on it). The stored value is mirrored to UserDefaults on every
+    /// write (same key, same raw-value encoding as before).
+    var connectionMode: ConnectionMode = DefaultsKeys.connectionModeValue() {
+        didSet {
+            UserDefaults.standard.set(
+                connectionMode.rawValue,
+                forKey: DefaultsKeys.connectionMode
+            )
+        }
+    }
+
     /// Set when a *configured* connection is rejected for authentication
     /// (HTTP 401/403 on the REST probe, or the WS handshake is rejected for auth
     /// repeatedly). The shell reads this alongside `.needsSetup` to route to
@@ -355,6 +376,51 @@ final class ConnectionStore {
     /// The token for the active connection (kept in memory; also in Keychain).
     private var currentToken: String?
 
+    /// Injectable connect implementation (tests). When non-nil the reconnect
+    /// loop calls this closure instead of `client.connect(...)` — the same
+    /// pattern as `SessionStore.resumeRPC`. Defaults to `nil`; the live path
+    /// is taken in production (the nil-check is free). Set by unit tests to
+    /// make the loop deterministic without a live socket.
+    var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
+
+    #if DEBUG
+    /// Injectable auth-revoke probe (tests). When non-nil, replaces the live
+    /// `probeIsAuthRevoked` REST call with this closure's return value so unit
+    /// tests can drive the threshold → `reauthRequired` flip without a server.
+    /// `nil` in production (the nil-check is free). Pattern mirrors `connectRPC`.
+    var probeIsAuthRevokedRPC: (() async -> Bool)?
+
+    /// Injectable backoff override (tests). When non-nil, `backoffDelay(attempt:)`
+    /// returns this value instead of the exponential schedule, so tests that
+    /// must drive multiple consecutive failures (threshold ≥ 3) do not stall
+    /// for seconds of wall-clock time. `nil` = normal exponential schedule.
+    var reconnectBackoffOverride: Double?
+
+    /// Injectable liveness probe (tests). When non-nil, replaces the live
+    /// `client.probeLiveness()` call in `handleScenePhase` with this closure's
+    /// return value so unit tests can drive the dead-socket routing path without
+    /// needing to inject a full mock transport into the store's own client (which
+    /// is `let`/init-time). A `false` result exercises the full detection →
+    /// reconcile → reconnect routing. Pattern mirrors `connectRPC`/`steerRPC`.
+    var probeLivenessRPC: ((_ timeout: Duration) async -> Bool)?
+
+    /// Injectable socket-state override for `handleScenePhase` (tests). When
+    /// non-nil, `handleScenePhase` uses this value instead of reading
+    /// `client.state` — which is not injectable because `client` is a `let`
+    /// property created at init time. Allows the `dead` branch (socket
+    /// `.closed`/`.failed`) to be exercised without a real transport. Pattern
+    /// mirrors `probeLivenessRPC`.
+    var clientStateOverrideForScenePhase: GatewayConnectionState?
+
+    /// Retains the most recent reconnect `Task` even after completion, so tests
+    /// can `await waitForReconnectForTesting()` to deterministically block until
+    /// the loop exits rather than racing a fixed `Task.sleep`. Unlike
+    /// `reconnectTask` (niled on completion inside the task), this is only
+    /// written — never cleared — so `await value` resolves once and only once.
+    var lastReconnectTask: Task<Void, Never>?
+    func waitForReconnectForTesting() async { await lastReconnectTask?.value }
+    #endif
+
     /// Tasks that live as long as the client: the event router and the
     /// state-change observer. Started once on the first successful configure.
     private var eventRouterTask: Task<Void, Never>?
@@ -590,7 +656,7 @@ final class ConnectionStore {
         }
 
         do {
-            try await client.connect(baseURL: url, token: trimmedToken)
+            try await client.connect(baseURL: url, token: trimmedToken, mode: connectionMode)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             phase = .offline(message)
@@ -728,6 +794,14 @@ final class ConnectionStore {
             sessionStore.startDraft()
         }
         phase = .connected
+        // Enforce the invariant `phase == .connected ⟹ hasConnected == true`.
+        // The normal path (configure() → client.connect() succeeds) already sets
+        // `hasConnected = true` before finishHydration() runs, so this is
+        // idempotent there. The direct-call path (unit tests, and any future
+        // re-hydration shortcut) was missing this set — the tests in #23 and the
+        // RootView gate both rely on the invariant, so we enforce it here rather
+        // than relying on the caller to have set it first.
+        hasConnected = true
         // Safety net: if the hydration race was won by the hard timeout branch,
         // branch 1's model probe was cancelled mid-flight and the composer chip
         // would render empty. Re-run the probe (best-effort, off the reveal path)
@@ -801,6 +875,9 @@ final class ConnectionStore {
         // its reconnect guard stays quiet because `hasConnected` was cleared
         // above, BEFORE the close.
         chatStore.handleConnectionDrop()
+        // clear any stuck turn flags on explicit disconnect so a later
+        // re-pair starts with a clean carry-forward slate.
+        sessionStore.clearAllTurnsInProgress()
         await client.disconnect()
         phase = .needsSetup
     }
@@ -930,7 +1007,25 @@ final class ConnectionStore {
                     ?? (event.sessionId == sessionStore.activeRuntimeId
                         ? sessionStore.activeStoredId : nil)
                 sessionStore.noteActivity(storedId: activityStoredId)
+                // maintain the explicit turn-in-progress registry so
+                // mergeSessionPage's carry-forward gate is gated on a real
+                // lifecycle event, not the 10s liveWindow time-proxy.
+                if event.type == .messageStart {
+                    sessionStore.markTurnStarted(storedId: activityStoredId)
+                } else {
+                    // .messageComplete — turn finished; server lastActive is now
+                    // authoritative, so the carry-forward can release.
+                    sessionStore.markTurnCompleted(storedId: activityStoredId)
+                }
                 scheduleSessionRefresh()
+            case .error:
+                // A gateway error is a turn TERMINAL (ChatStore also handles it).
+                // Clear the turn-in-progress flag so the carry-forward releases
+                // and the server's lastActive becomes authoritative again.
+                let errorStoredId = event.storedSessionId
+                    ?? (event.sessionId == sessionStore.activeRuntimeId
+                        ? sessionStore.activeStoredId : nil)
+                sessionStore.markTurnCompleted(storedId: errorStoredId)
             default:
                 break
             }
@@ -1012,6 +1107,10 @@ final class ConnectionStore {
             // Idempotent, so the repeated `.failed` transitions
             // of the reconnect loop's own attempts are harmless.
             chatStore.handleConnectionDrop()
+            // belt-and-suspenders: a mid-turn socket drop must NOT leave
+            // any session's turnInProgress flag stuck — that would permanently
+            // carry-forward a local lastActive bump, reviving the bug.
+            sessionStore.clearAllTurnsInProgress()
             // A drop after we were connected → reconnect. An expected close
             // (disconnect/needsSetup) leaves `hasConnected` false.
             guard hasConnected, reconnectTask == nil else { return }
@@ -1039,7 +1138,11 @@ final class ConnectionStore {
                 // adding even the base 0.5s delay is perceptible dead air.
                 // Subsequent attempts back off normally.
                 if attempt > 0 {
+                    #if DEBUG
+                    let delay = self.reconnectBackoffOverride ?? Self.backoffDelay(attempt: attempt)
+                    #else
                     let delay = Self.backoffDelay(attempt: attempt)
+                    #endif
                     try? await Task.sleep(for: .seconds(delay))
                 }
                 if Task.isCancelled { return }
@@ -1059,7 +1162,11 @@ final class ConnectionStore {
                 }
 
                 do {
-                    try await self.client.connect(baseURL: url, token: token)
+                    if let hook = self.connectRPC {
+                        try await hook(url, token, self.connectionMode)
+                    } else {
+                        try await self.client.connect(baseURL: url, token: token, mode: self.connectionMode)
+                    }
                     if Task.isCancelled { return }
                     await self.recoverActiveSession()
                     self.phase = .connected
@@ -1086,6 +1193,9 @@ final class ConnectionStore {
                 }
             }
         }
+        #if DEBUG
+        lastReconnectTask = reconnectTask
+        #endif
     }
 
     /// Re-probe REST to determine whether the saved token has been revoked.
@@ -1094,6 +1204,9 @@ final class ConnectionStore {
     /// reconnect loop keeps retrying rather than dumping the user to re-pair on a
     /// transient outage.
     private func probeIsAuthRevoked(url: URL, token: String) async -> Bool {
+        #if DEBUG
+        if let hook = probeIsAuthRevokedRPC { return await hook() }
+        #endif
         do {
             _ = try await RestClient(baseURL: url, token: token).status()
             return false
@@ -1221,6 +1334,21 @@ final class ConnectionStore {
     var devicesSectionVisible: Bool {
         capabilities.devices == .available
     }
+
+    /// DEBUG-only test seam: seed the in-memory connection state as if a prior
+    /// `configure()` succeeded (stable URL + token stored, `hasConnected` true)
+    /// then arm and fire the reconnect loop. Exercises the restart-survival path
+    /// (4b) without a live socket: pair with `connectRPC` to inject a fake
+    /// transport sequence (fail-once-then-succeed, immediate auth-revocation, …).
+    ///
+
+    /// Must only be called from unit tests — absent in Release.
+    func _seedAndStartReconnect(serverURL: String, token: String) {
+        serverURLString = serverURL
+        currentToken = token
+        hasConnected = true
+        startReconnectLoop()
+    }
     #endif
 
     /// The best client-side device-name hint available without a new entitlement.
@@ -1320,7 +1448,12 @@ final class ConnectionStore {
 
         Task { [weak self] in
             guard let self else { return }
+            #if DEBUG
+            let _liveState = await self.client.state
+            let socketState = self.clientStateOverrideForScenePhase ?? _liveState
+            #else
             let socketState = await self.client.state
+            #endif
             let dead: Bool
             switch socketState {
             case .closed, .failed: dead = true
@@ -1344,8 +1477,62 @@ final class ConnectionStore {
                 // before reconnecting so the recovery backfill isn't no-op'd
                 //.
                 self.chatStore.handleConnectionDrop()
+                // the state observer's clearAllTurnsInProgress() may not
+                // have fired either (same reason as handleConnectionDrop above).
+                // Clear here so the subsequent recoverActiveSession→refresh→
+                // mergeSessionPage doesn't carry a stale lastActive forward.
+                self.sessionStore.clearAllTurnsInProgress()
+                // Inc-1: a dead socket means any in-progress turn is
+                // interrupted; reconcile the LA so an orphaned "Thinking" activity
+                // is dismissed rather than expiring on the lock screen at staleAfter.
+                LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
                 self.startReconnectLoop()
             } else if case .connected = self.phase {
+                // verify the socket is still alive with a read-only ping
+                // before attempting the REST backfill. A silent-dead socket that
+                // reports `.connected` at the transport level would otherwise pass
+                // the `dead` check above, enter the backfill path, and then stall
+                // or fail there. `probeLiveness` calls `handleSocketFailure` on a
+                // dead ping, flipping transport state to `.failed` so the existing
+                // state-observer–driven reconnect loop starts immediately.
+                //
+
+                // In DEBUG builds, `probeLivenessRPC` can be injected by tests to
+                // exercise the full detection → reconcile → reconnect routing path
+                // without needing to drive the real URLSession ping machinery.
+                let alive: Bool
+                #if DEBUG
+                if let hook = self.probeLivenessRPC {
+                    alive = await hook(HermesGatewayClient.livenessPingTimeout)
+                } else {
+                    alive = await self.client.probeLiveness()
+                }
+                #else
+                alive = await self.client.probeLiveness()
+                #endif
+                guard alive else {
+                    // the real `probeLiveness` path calls `handleSocketFailure`
+                    // which sets transport state to `.failed`; the existing state observer
+                    // then starts the reconnect loop. In tests the injected hook does NOT
+                    // call `handleSocketFailure`, so we start the loop explicitly here to
+                    // keep the routing correct in both code paths.
+                    LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
+                    // in the real path the state observer's .failed transition
+                    // fires clearAllTurnsInProgress(); in the injected-hook test path the
+                    // observer is never driven, so clear explicitly here to guarantee the
+                    // flag can't stay stuck and revive the never-converge bug.
+                    self.sessionStore.clearAllTurnsInProgress()
+                    if self.reconnectTask != nil {
+                        self.reconnectTask?.cancel()
+                        self.reconnectTask = nil
+                    }
+                    self.startReconnectLoop()
+                    return
+                }
+                // Inc-1: on a healthy foreground, reconcile the LA so
+                // any orphaned activity (e.g. from a previous backgrounded turn
+                // whose message.complete was missed) is dismissed.
+                LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
                 await self.chatStore.backfill()
                 // refresh the session list on foreground so the
                 // drawer reflects changes made on other clients while the app

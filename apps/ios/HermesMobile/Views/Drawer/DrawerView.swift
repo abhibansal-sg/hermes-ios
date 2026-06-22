@@ -458,6 +458,9 @@ struct DrawerView: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: searchIconSize))
                     .foregroundStyle(theme.mutedFg)
+                    // Decorative — the adjacent TextField already announces "Search";
+                    // hiding prevents VoiceOver from double-reading the icon.
+                    .accessibilityHidden(true)
                 TextField("Search", text: $sessions.searchQuery)
                     .textFieldStyle(.plain)
                     .font(.system(size: searchFieldFontSize))
@@ -1091,6 +1094,27 @@ struct DrawerView: View {
                         // VC-02: search result tap haptic
                         .sensoryFeedback(.selection, trigger: searchResultFeedbackTrigger)
                     }
+                }
+                // Infinite-scroll sentinel: fires loadMoreSearchResults() when the
+                // last result row scrolls into view. While a load-more is in flight
+                // a small spinner replaces the sentinel so the user knows more rows
+                // are coming. Hidden once searchHasMore is false (short page or cap).
+                if sessions.searchHasMore || sessions.isSearchLoadingMore {
+                    plainRow {
+                        HStack {
+                            Spacer()
+                            if sessions.isSearchLoadingMore {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Spacer()
+                        }
+                        .frame(height: 36)
+                        .onAppear {
+                            sessions.loadMoreSearchResults()
+                        }
+                    }
+                    .accessibilityHidden(true)
                 }
             } header: {
                 DrawerSectionHeader(title: "Results")
