@@ -1,3 +1,5 @@
+> **Superseded** — this standalone app evolved into [hermes-mobile](https://github.com/abhibansal-sg/hermes-mobile), a public fork of NousResearch/hermes-agent with the iOS app + gateway plugin. All active development happens there.
+
 # Hermes Agent — iOS app (HermesMobile)
 
 Your Hermes agent, on your phone. Live-streaming chat, approvals, push
